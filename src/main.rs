@@ -1,170 +1,203 @@
-use std::{
-    fs,
-    io::{self, Read},
-    path,
-    sync::Arc,
-};
-
-use anyhow::Context;
-
-use clap::{arg, command, Parser};
-use rustls::pki_types::CertificateDer;
-use webtransport_quinn::Session;
-
-#[derive(Parser, Debug)]
-#[command(author, version, about, long_about = None)]
-struct Args {
-    #[arg(short, long, default_value = "[::]:4443")]
-    addr: std::net::SocketAddr,
-
-    /// Use the certificates at this path, encoded as PEM.
-    #[arg(long)]
-    pub tls_cert: path::PathBuf,
-
-    /// Use the private key at this path, encoded as PEM.
-    #[arg(long)]
-    pub tls_key: path::PathBuf,
-}
+use anyhow::Result;
+use std::fs;
+use std::result::Result::Ok;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::Mutex;
+use tokio::task;
+use tracing::error;
+use tracing::info;
+use tracing::info_span;
+use tracing::Instrument;
+use tracing_subscriber::filter::LevelFilter;
+use tracing_subscriber::EnvFilter;
+use wtransport::endpoint::IncomingSession;
+use wtransport::Connection;
+use wtransport::Endpoint;
+use wtransport::Identity;
+use wtransport::ServerConfig;
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    // Enable info logging.
-    let env = env_logger::Env::default().default_filter_or("info");
-    env_logger::init_from_env(env);
+async fn main() -> Result<()> {
+    init_logging();
 
-    let args = Args::parse();
+    // let identity = Identity::load_pemfiles("server.crt", "server.key").await?;
+    let identity = Identity::load_pemfiles("certificate.pem", "certificate.key").await.expect("Failed to load cert");
+    // let identity = Identity::load_pemfiles("/etc/ssl/certs/mkcert_development_CA_263446088470421260956769455254426110751.pem");
 
-    // Read the PEM certificate chain
-    let chain = fs::File::open(args.tls_cert).context("failed to open cert file")?;
-    let mut chain = io::BufReader::new(chain);
+    // let config = ServerConfig::builder()
+    //     .with_bind_address("0.0.0.0:4433".parse().unwrap())
+    //     .with_identity(identity)
+    //     .keep_alive_interval(Some(Duration::from_secs(3)))
+    //     .build();
 
-    let chain: Vec<CertificateDer> = rustls_pemfile::certs(&mut chain)
-        .collect::<Result<_, _>>()
-        .context("failed to load certs")?;
+    let config = ServerConfig::builder()
+        .with_bind_address("127.0.0.1:4433".parse().unwrap()) // Pastikan client pakai localhost/IP server
+        .with_identity(identity)
+        .keep_alive_interval(Some(Duration::from_secs(3))) // Pastikan koneksi tetap aktif
+        .build();
+    // let config = ServerConfig::builder()
+    //     .with_bind_default(4433)
+    //     .with_identity(Identity::self_signed(["localhost"]).unwrap())
+    //     .keep_alive_interval(Some(Duration::from_secs(3)))
+    //     .build();
 
-    anyhow::ensure!(!chain.is_empty(), "could not find certificate");
+    let server = Endpoint::server(config)?;
 
-    // Read the PEM private key
-    let mut keys = fs::File::open(args.tls_key).context("failed to open key file")?;
+    info!("Server ready!");
 
-    // Read the keys into a Vec so we can parse it twice.
-    let mut buf = Vec::new();
-    keys.read_to_end(&mut buf)?;
+    let address = server.local_addr()?;
+    let ipv4_address = match address {
+        std::net::SocketAddr::V4(addr) => addr.to_string(),
+        std::net::SocketAddr::V6(addr) => format!("{} (IPv6)", addr),
+    };
+    info!("Server running on {}", ipv4_address);
 
-    // Try to parse a PKCS#8 key
-    // -----BEGIN PRIVATE KEY-----
-    let key = rustls_pemfile::private_key(&mut io::Cursor::new(&buf))
-        .context("failed to load private key")?
-        .context("missing private key")?;
+    // let server = Endpoint::server(config)?;
+    // let server = Arc::new(server); // Bungkus dalam Arc
+    // let connections = Arc::new(Mutex::new(Vec::<Connection>::new())); // Simpan koneksi aktif
 
-    // Standard Quinn setup
-    let mut config = rustls::ServerConfig::builder_with_provider(Arc::new(
-        rustls::crypto::ring::default_provider(),
-    ))
-    .with_protocol_versions(&[&rustls::version::TLS13])?
-    .with_no_client_auth()
-    .with_single_cert(chain, key)?;
+    info!("Server ready! Listening on {}", server.local_addr()?);
 
-    config.max_early_data_size = u32::MAX;
-    config.alpn_protocols = vec![webtransport_quinn::ALPN.to_vec()]; // this one is important
+    // task for send automatic message
+    // let connections_clone = Arc::clone(&connections);
+    // tokio::spawn(async move {
+    //     loop {
+    //         tokio::time::sleep(Duration::from_secs(1)).await;
+    //         let message = format!("Message from server at {:?}", std::time::SystemTime::now());
+    //         info!("Auto-Sent: {}", message);
 
-    let config: quinn::crypto::rustls::QuicServerConfig = config.try_into()?;
-    let config = quinn::ServerConfig::with_crypto(Arc::new(config));
+    //         let mut conns = connections_clone.lock().await;
+    //         for conn in conns.iter() {
+    //             if let Ok(stream_fut) = conn.open_uni().await {
+    //                 if let Ok(mut stream) = stream_fut.await {
+    //                     let _ = stream.write_all(message.as_bytes()).await;
+    //                 }
+    //             }
+    //         }
+    //     }
+    // });
 
-    log::info!("listening on {}", args.addr);
+    // Looping for get new connection
+    // let connections_clone = Arc::clone(&connections);
+    // for id in 0.. {
+    //     let incoming_session = server.accept().await;
+    //     let connections_clone = Arc::clone(&connections_clone);
+    //     tokio::spawn(async move {
+    //         if let Ok(conn) = handle_connection(incoming_session).await {
+    //             connections_clone.lock().await.push(conn);
+    //         }
+    //     });
+    // }
 
-    let server = quinn::Endpoint::server(config, args.addr)?;
+    // Ok(())
+    for id in 0.. {
+        let incoming_session = server.accept().await;
+        tokio::spawn(handle_connection(incoming_session).instrument(info_span!("Connection", id)));
+    }
 
-    // Accept new connections.
-    while let Some(conn) = server.accept().await {
-        tokio::spawn(async move {
-            let err = run_conn(conn).await;
-            if let Err(err) = err {
-                log::error!("connection failed: {}", err)
+    Ok(())
+}
+
+async fn handle_connection(incoming_session: IncomingSession) {
+    let result = handle_connection_impl(incoming_session).await;
+    error!("{:?}", result);
+}
+
+async fn handle_connection_impl(incoming_session: IncomingSession) -> Result<()> {
+    let mut buffer = vec![0; 65536].into_boxed_slice();
+
+    info!("Waiting for session request...");
+
+    let session_request = incoming_session.await?;
+
+    info!(
+        "New session: Authority: '{}', Path: '{}'",
+        session_request.authority(),
+        session_request.path()
+    );
+
+    let connection = session_request.accept().await?;
+
+    info!("Waiting for data from client...");
+
+    // Send data 100 times
+    let connection_clone = connection.clone();
+    task::spawn(async move {
+        for i in 1..=1000 {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+
+            match connection_clone.open_uni().await {
+                Ok(stream_fut) => match stream_fut.await {
+                    Ok(mut stream) => {
+                        let message = format!("Message {} from server", i);
+                        if let Err(e) = stream.write_all(message.as_bytes()).await {
+                            error!("Failed to send message {}: {:?}", i, e);
+                        } else {
+                            info!("Sent: {}", message);
+                        }
+                    }
+                    Err(e) => error!("Failed to open unidirectional stream: {:?}", e),
+                },
+                Err(e) => error!("Failed to create stream future: {:?}", e),
             }
-        });
-    }
+        }
+        info!("Finished sending 100 messages.");
+    });
 
-    // TODO simple echo server
-
-    Ok(())
-}
-
-async fn run_conn(conn: quinn::Incoming) -> anyhow::Result<()> {
-    log::info!("received new QUIC connection");
-
-    // Wait for the QUIC handshake to complete.
-    let conn = conn.await.context("failed to accept connection")?;
-    log::info!("established QUIC connection");
-
-    // Perform the WebTransport handshake.
-    let request = webtransport_quinn::Request::accept(conn).await?;
-    log::info!("received WebTransport request: {}", request.url());
-
-    // Accept the session.
-    let session = request.ok().await.context("failed to accept session")?;
-    log::info!("accepted session");
-
-    // Run the session
-    if let Err(err) = run_session(session).await {
-        log::info!("closing session: {}", err);
-    }
-
-    Ok(())
-}
-
-async fn run_session(session: Session) -> anyhow::Result<()> {
     loop {
-        // Wait for a bidirectional stream or datagram.
         tokio::select! {
-            res = session.accept_bi() => {
-                let (mut send, mut recv) = res?;
-                log::info!("accepted stream");
+            stream = connection.accept_bi() => {
+                let mut stream = stream?;
+                info!("Accepted BI stream");
 
-                // Read the message and echo it back.
-                let msg = recv.read_to_end(1024).await?;
-                log::info!("recv: {}", String::from_utf8_lossy(&msg));
+                let bytes_read = match stream.1.read(&mut buffer).await? {
+                    Some(bytes_read) => bytes_read,
+                    None => continue,
+                };
 
-                send.write_all(&msg).await?;
-                log::info!("send: {}", String::from_utf8_lossy(&msg));
-            },
-            res = session.read_datagram() => {
-                let msg = res?;
-                log::info!("accepted datagram");
-                log::info!("recv: {}", String::from_utf8_lossy(&msg));
+                let str_data = std::str::from_utf8(&buffer[..bytes_read])?;
 
-                session.send_datagram(msg.clone())?;
-                log::info!("send: {}", String::from_utf8_lossy(&msg));
-            },
-        };
+                info!("Received (bi) '{str_data}' from client");
 
-        log::info!("echo successful!");
+                stream.0.write_all(b"ACK").await?;
+            }
+            stream = connection.accept_uni() => {
+                let mut stream = stream?;
+                info!("Accepted UNI stream");
+
+                let bytes_read = match stream.read(&mut buffer).await? {
+                    Some(bytes_read) => bytes_read,
+                    None => continue,
+                };
+
+                let str_data = std::str::from_utf8(&buffer[..bytes_read])?;
+
+                info!("Received (uni) '{str_data}' from client");
+
+                let mut stream = connection.open_uni().await?.await?;
+                stream.write_all(b"ACK").await?;
+            }
+            dgram = connection.receive_datagram() => {
+                let dgram = dgram?;
+                let str_data = std::str::from_utf8(&dgram)?;
+
+                info!("Received (dgram) '{str_data}' from client");
+
+                connection.send_datagram(b"ACK")?;
+            }
+        }
     }
 }
 
-// use webtransport_quinn::{ServerConfig, Server};
-// use std::sync::Arc;
+fn init_logging() {
+    let env_filter = EnvFilter::builder()
+        .with_default_directive(LevelFilter::INFO.into())
+        .from_env_lossy();
 
-// #[tokio::main]
-// async fn main() {
-//     let config = ServerConfig::builder()
-//         .with_bind_default(4433) // Jalankan di port 4433
-//         .with_certificate(
-//             include_bytes!("cert.pem").to_vec(),
-//             include_bytes!("key.pem").to_vec(),
-//         )
-//         .expect("Failed to load TLS cert/key")
-//         .build()
-//         .expect("Failed to configure WebTransport server");
-
-//     let server = Arc::new(Server::new(config));
-
-//     println!("🚀 WebTransport server running on https://localhost:4433");
-
-//     while let Ok(session) = server.accept().await {
-//         tokio::spawn(async move {
-//             println!("🎉 New WebTransport client connected!");
-//             let _ = session.accept_uni().await; // Terima data dari client
-//         });
-//     }
-// }
+    tracing_subscriber::fmt()
+        .with_target(true)
+        .with_level(true)
+        .with_env_filter(env_filter)
+        .init();
+}
